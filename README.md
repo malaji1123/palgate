@@ -36,7 +36,8 @@ python palgate_bot.py
 | `/requestaccess` | anyone | Send access request to admin |
 | `/adduser <id>` | admin | Approve a user directly |
 | `/removeuser <id>` | admin | Revoke access |
-| `/listusers` | admin | List approved users |
+| `/listusers` | admin | List approved users with join dates |
+| `/history` | admin | Show last 10 gate opens |
 | `/help` | all | Show available commands |
 
 ## Files
@@ -46,7 +47,7 @@ python palgate_bot.py
 | `palgate_link.py` | One-time device linking — writes session to `.env` |
 | `palgate_bot.py` | Telegram bot |
 | `.env` | Config + session credentials (gitignored) |
-| `palgate_users.json` | Approved Telegram users (gitignored) |
+| `palgate.db` | SQLite database — users & gate events (gitignored) |
 
 ## Notes
 

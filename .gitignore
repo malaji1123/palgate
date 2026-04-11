@@ -1,5 +1,6 @@
 .env
 palgate_users.json
+palgate.db
 __pycache__/
 .venv/
 *.pyc
