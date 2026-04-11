@@ -1,0 +1,5 @@
+requests
+python-dotenv
+python-telegram-bot>=20
+qrcode
+pylgate @ git+https://github.com/DonutByte/pylgate.git@main

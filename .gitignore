@@ -1,0 +1,5 @@
+.env
+palgate_users.json
+__pycache__/
+.venv/
+*.pyc
