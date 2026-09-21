@@ -21,7 +21,7 @@ from dotenv import set_key
 from pylgate.types import TokenType
 
 BASE_URL = "https://api1.pal-es.com/v1/bt/"
-ENV_FILE = Path(__file__).parent / ".env"
+ENV_FILE = Path(__file__).parent / (".amir.env" if (Path(__file__).parent / ".amir.env").exists() else ".env")
 
 
 def basic_headers():

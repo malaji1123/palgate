@@ -21,12 +21,16 @@ Setup:
     4. python palgate_bot.py
 """
 
+import asyncio
+import json
 import logging
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 
 import requests
 import pylgate
@@ -38,18 +42,30 @@ from telegram.ext import (
     ContextTypes, Application,
 )
 
-load_dotenv()
+_env_file = os.getenv("ENV_FILE")
+if _env_file and os.path.exists(_env_file):
+    load_dotenv(_env_file)
+elif os.path.exists("./.amir.env"):
+    load_dotenv("./.amir.env")
+else:
+    load_dotenv()
 
-BOT_TOKEN     = os.environ["BOT_TOKEN"]
-ADMIN_USER_ID = int(os.environ["ADMIN_USER_ID"])
-DEVICE_ID     = os.environ["DEVICE_ID"]
+BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+DEVICE_ID     = os.getenv("DEVICE_ID", "")
 OUTPUT_NUM    = int(os.getenv("OUTPUT_NUM", "1"))
+HTTP_PORT     = int(os.getenv("HTTP_PORT", "8080"))
+API_KEY       = os.getenv("API_KEY", "")
 
 DB_FILE  = Path(__file__).parent / "palgate.db"
 BASE_URL = "https://api1.pal-es.com/v1/bt/"
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
+
+# Global references for async notification from the sync HTTP server thread
+_app_instance: Application | None = None
+_loop_instance: asyncio.AbstractEventLoop | None = None
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -156,9 +172,16 @@ def get_recent_events(limit: int = 10) -> list[sqlite3.Row]:
 # ── Gate ──────────────────────────────────────────────────────────────────────
 
 def open_gate() -> tuple[bool, str]:
-    phone = int(os.environ["PHONE_NUMBER"])
-    token = bytes.fromhex(os.environ["SESSION_TOKEN"])
-    ttype = TokenType(int(os.environ["TOKEN_TYPE"]))
+    phone_val = os.getenv("PHONE_NUMBER")
+    token_val = os.getenv("SESSION_TOKEN")
+    ttype_val = os.getenv("TOKEN_TYPE")
+
+    if not (phone_val and token_val and ttype_val and DEVICE_ID):
+        return False, "Missing PalGate configuration (PHONE_NUMBER, SESSION_TOKEN, TOKEN_TYPE, DEVICE_ID)"
+
+    phone = int(phone_val)
+    token = bytes.fromhex(token_val)
+    ttype = TokenType(int(ttype_val))
 
     headers = {
         "User-Agent": "okhttp/4.9.3",
@@ -387,9 +410,107 @@ async def set_admin_menu(bot):
 
 
 async def post_init(app: Application):
+    global _app_instance, _loop_instance
+    _app_instance = app
+    try:
+        _loop_instance = asyncio.get_running_loop()
+    except RuntimeError:
+        _loop_instance = None
     await app.bot.set_my_commands(USER_COMMANDS)
     await set_admin_menu(app.bot)
     log.info("Bot commands set.")
+
+
+# ── HTTP API (curl support) ──────────────────────────────────────────────────
+
+class GateHttpRequestHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status_code: int, data: dict):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _is_authenticated(self) -> bool:
+        configured_key = os.getenv("API_KEY", "")
+        if not configured_key:
+            return True  # If no API_KEY is set in env, allow access
+
+        # Check X-Api-Key header
+        if self.headers.get("X-Api-Key") == configured_key:
+            return True
+
+        # Check Authorization: Bearer <key>
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer ") and auth[7:].strip() == configured_key:
+            return True
+
+        # Check query parameter ?key=<key>
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        if qs.get("key", [None])[0] == configured_key:
+            return True
+
+        return False
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/health", "/status"):
+            self._send_json(200, {"status": "ok", "service": "palgate_bot"})
+            return
+        if parsed.path in ("/opengate", "/open"):
+            self._handle_open_gate()
+            return
+        self._send_json(404, {"status": "error", "message": "Endpoint not found"})
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/opengate", "/open"):
+            self._handle_open_gate()
+            return
+        self._send_json(404, {"status": "error", "message": "Endpoint not found"})
+
+    def _handle_open_gate(self):
+        if not self._is_authenticated():
+            self._send_json(401, {
+                "status": "error",
+                "message": "Unauthorized. Provide API key via header 'X-Api-Key' or '?key=...'"
+            })
+            return
+
+        log.info("Gate open triggered via HTTP API (curl)")
+        try:
+            success, result = open_gate()
+            log_gate_event(0, "curl_api", success, result)
+
+            if _app_instance and _loop_instance and ADMIN_USER_ID:
+                try:
+                    msg = f"🚪 Gate opened via API (curl): {result}" if success else f"⚠️ Gate open failed via API: {result}"
+                    asyncio.run_coroutine_threadsafe(
+                        _app_instance.bot.send_message(chat_id=ADMIN_USER_ID, text=msg),
+                        _loop_instance,
+                    )
+                except Exception as ex:
+                    log.warning(f"Could not send Telegram notification for API call: {ex}")
+
+            status_code = 200 if success else 500
+            self._send_json(status_code, {"status": "ok" if success else "failed", "message": result})
+        except Exception as e:
+            log.error(f"HTTP gate open failed: {e}")
+            log_gate_event(0, "curl_api", False, str(e))
+            self._send_json(500, {"status": "error", "message": str(e)})
+
+    def log_message(self, format, *args):
+        log.info("HTTP %s - " + format, self.address_string(), *args)
+
+
+def start_http_server(port: int, host: str = "0.0.0.0") -> HTTPServer:
+    server = HTTPServer((host, port), GateHttpRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info(f"HTTP API server listening on http://{host}:{port}")
+    return server
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -400,6 +521,13 @@ def main():
         return
 
     db_init()
+
+    # Start HTTP API server for curl / direct access
+    if HTTP_PORT > 0:
+        try:
+            start_http_server(HTTP_PORT)
+        except Exception as e:
+            log.error(f"Failed to start HTTP server on port {HTTP_PORT}: {e}")
 
     app = (
         ApplicationBuilder()
